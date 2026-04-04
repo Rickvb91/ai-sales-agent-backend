@@ -9,17 +9,17 @@ import fetch from 'node-fetch';
 dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3001;
+const PD_TOKEN = process.env.PIPEDRIVE_API_KEY;
+const PD_BASE = 'https://api.pipedrive.com/v1';
 
 app.use(helmet({ crossOriginResourcePolicy: false }));
 app.use(express.json({ limit: '10kb' }));
-
-// Open CORS - widget staat op meerdere domeinen (Framer, synergroen.nl, etc.)
 app.use(cors({ origin: '*', methods: ['GET', 'POST'], allowedHeaders: ['Content-Type'] }));
 app.use(rateLimit({ windowMs: 60000, max: 100, standardHeaders: true, legacyHeaders: false }));
 
 app.get('/health', (_req, res) => res.json({ status: 'ok', timestamp: new Date().toISOString() }));
 
-// Chat via Anthropic Claude
+// ── AI Chat (Anthropic streaming) ─────────────────────────────────────────────
 app.post('/api/chat',
   [body('messages').isArray({ min: 1 }), body('messages.*.role').isIn(['user','assistant','system']), body('messages.*.content').isString().trim().notEmpty()],
   async (req, res) => {
@@ -60,42 +60,65 @@ app.post('/api/chat',
   }
 );
 
-// Pipedrive leads
+// ── Pipedrive Lead (token blijft op server, nooit in browser) ─────────────────
 app.post('/api/leads',
   [body('name').isString().trim().notEmpty(), body('email').isEmail().normalizeEmail()],
   async (req, res) => {
     const errors = validationResult(req);
     if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+    if (!PD_TOKEN) return res.status(503).json({ error: 'PIPEDRIVE_NOT_CONFIGURED' });
+
     const { name, email, phone, company, message, chatHistory = [] } = req.body;
-    const PD = process.env.PIPEDRIVE_API_KEY;
-    const BASE = 'https://api.pipedrive.com/v1';
-    if (!PD) { console.log('[LEAD]', name, email); return res.json({ success: true, fallback: true }); }
     try {
-      const search = await (await fetch(BASE + '/persons/search?term=' + encodeURIComponent(email) + '&fields=email&api_token=' + PD)).json();
-      const existing = search?.data?.items?.[0]?.item;
-      let personId = existing?.id;
-      if (!existing) {
-        const pb = { name, email: [{ value: email, primary: true }] };
-        if (phone) pb.phone = [{ value: phone, primary: true }];
-        personId = (await (await fetch(BASE + '/persons?api_token=' + PD, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(pb) })).json())?.data?.id;
-        let orgId;
-        if (company) {
-          orgId = (await (await fetch(BASE + '/organizations?api_token=' + PD, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: company }) })).json())?.data?.id;
-          if (orgId) await fetch(BASE + '/persons/' + personId + '?api_token=' + PD, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ org_id: orgId }) });
-        }
-        const dealId = (await (await fetch(BASE + '/deals?api_token=' + PD, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: 'Lead AI Widget — ' + name, person_id: personId, ...(orgId && { org_id: orgId }) }) })).json())?.data?.id;
-        if (dealId) {
-          let note = 'Lead SynerGroen AI Widget\n' + new Date().toLocaleString('nl-NL') + '\n\n';
-          if (message) note += 'Bericht:\n' + message + '\n\n';
-          if (chatHistory.length) note += 'Chat:\n' + chatHistory.map(m => (m.role === 'user' ? 'Bezoeker' : 'AI') + ': ' + m.content).join('\n');
-          await fetch(BASE + '/notes?api_token=' + PD, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: note, deal_id: dealId }) });
-        }
-        return res.json({ success: true, personId, dealId });
+      // 1. Persoon aanmaken
+      const personBody = { name, email: [{ value: email, primary: true, label: 'work' }] };
+      if (phone) personBody.phone = [{ value: phone, primary: true, label: 'work' }];
+      const pr = await fetch(PD_BASE + '/persons?api_token=' + PD_TOKEN, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify(personBody)
+      });
+      const pid = (await pr.json())?.data?.id;
+      if (!pid) return res.status(502).json({ error: 'PERSON_FAILED' });
+
+      // 2. Organisatie (optioneel)
+      let orgId;
+      if (company) {
+        const or = await fetch(PD_BASE + '/organizations?api_token=' + PD_TOKEN, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: company })
+        });
+        orgId = (await or.json())?.data?.id;
+        if (orgId) await fetch(PD_BASE + '/persons/' + pid + '?api_token=' + PD_TOKEN, {
+          method: 'PUT', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ org_id: orgId })
+        });
       }
-      res.json({ success: true, existing: true, personId });
-    } catch (err) { console.error('[PD]', err.message); res.status(502).json({ error: 'PIPEDRIVE_ERROR', message: err.message }); }
+
+      // 3. Deal aanmaken
+      const dr = await fetch(PD_BASE + '/deals?api_token=' + PD_TOKEN, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({ title: 'Lead AI Widget \u2014 ' + name, person_id: pid, ...(orgId && { org_id: orgId }) })
+      });
+      const did = (await dr.json())?.data?.id;
+
+      // 4. Note met chatgeschiedenis
+      if (did) {
+        let note = 'Lead via SynerGroen AI Chat Widget\n' + new Date().toLocaleString('nl-NL') + '\n';
+        if (message) note += '\nBericht: ' + message;
+        if (chatHistory.length) note += '\n\nChat:\n' + chatHistory.map(m => (m.role === 'user' ? 'Bezoeker' : 'AI') + ': ' + m.content).join('\n');
+        await fetch(PD_BASE + '/notes?api_token=' + PD_TOKEN, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content: note, deal_id: did })
+        });
+      }
+
+      res.json({ success: true, personId: pid, dealId: did });
+    } catch (err) {
+      console.error('[PD]', err.message);
+      res.status(502).json({ error: 'PIPEDRIVE_ERROR', message: err.message });
+    }
   }
 );
 
-app.use((err, _req, res, _next) => res.status(500).json({ error: 'SERVER_ERROR', message: err.message }));
+app.use((err, _req, res, _next) => res.status(500).json({ error: 'SERVER_ERROR' }));
 app.listen(PORT, () => console.log('SynerGroen backend poort ' + PORT));
